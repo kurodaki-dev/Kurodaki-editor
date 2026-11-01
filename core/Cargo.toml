@@ -9,3 +9,13 @@ description = "Document model, renderer and export for Kurodaki Editor"
 tiny-skia = "0.11"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+tract-onnx = { version = "0.21", optional = true }
+anyhow = { version = "1", optional = true }
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[features]
+default = []
+onnx = ["dep:tract-onnx", "dep:anyhow"]

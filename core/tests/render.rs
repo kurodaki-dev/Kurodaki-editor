@@ -71,3 +71,34 @@ fn json_roundtrip_and_png() {
     assert_eq!(&png[1..4], b"PNG");
     assert!(matches!(render_page(&Page::new(0, 0)), Err(RenderError::InvalidSize)));
 }
+
+#[test]
+fn effects_and_mask() {
+    let mut px = vec![200u8, 100, 50, 255];
+    apply_effect(&mut px, Effect::Invert);
+    assert_eq!(px, vec![55, 155, 205, 255]);
+    let mut g = vec![255u8, 0, 0, 255];
+    apply_effect(&mut g, Effect::Grayscale);
+    assert!(g[0] == g[1] && g[1] == g[2] && g[3] == 255);
+    let mut dull: Vec<u8> = (0..16).flat_map(|i| [80 + i, 80 + i, 80 + i, 255]).collect();
+    apply_effect(&mut dull, Effect::AutoEnhance);
+    let (mn, mx) = (dull[0], dull[60]);
+    assert!(mx as i32 - mn as i32 > 150);
+
+    let mut layer = Layer::image("i", 0.0, 0.0, 2, 1, vec![9, 9, 9, 255, 9, 9, 9, 255]);
+    assert!(apply_mask(&mut layer, &[255, 0]));
+    assert!(!apply_mask(&mut layer, &[1, 2, 3]));
+    if let LayerKind::Image { rgba, .. } = &layer.kind {
+        assert_eq!((rgba[3], rgba[7]), (255, 0));
+    }
+}
+
+#[test]
+fn decode_png_and_reject_garbage() {
+    let mut buf = Vec::new();
+    let img = image::RgbaImage::from_pixel(8, 4, image::Rgba([1, 2, 3, 255]));
+    img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png).unwrap();
+    let l = decode_image("x", &buf, 4).unwrap();
+    assert!(l.width <= 4.0 && l.height <= 4.0);
+    assert!(decode_image("x", b"not an image", 100).is_err());
+}

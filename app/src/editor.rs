@@ -1,5 +1,38 @@
 use egui::{Color32, Pos2, Sense, Vec2};
-use kurodaki_core::{render_page, render_png, Color, Document, Layer, LayerKind};
+use kurodaki_core::{
+    apply_effect, apply_mask, decode_image, render_page, render_png, segment::Segmenter, Color,
+    Document, Effect, Layer, LayerKind,
+};
+use std::path::PathBuf;
+
+const IMAGE_EXT: [&str; 4] = ["png", "jpg", "jpeg", "webp"];
+const MODEL_SIDE: usize = 320;
+
+fn storage() -> PathBuf {
+    PathBuf::from(std::env::var("EXTERNAL_STORAGE").unwrap_or_else(|_| "/sdcard".into()))
+}
+
+fn list_images() -> Vec<PathBuf> {
+    let root = storage();
+    let mut out = Vec::new();
+    for dir in ["Pictures", "DCIM/Camera", "Download", "Kurodaki"] {
+        if let Ok(rd) = std::fs::read_dir(root.join(dir)) {
+            for e in rd.flatten() {
+                let p = e.path();
+                let ok = p
+                    .extension()
+                    .and_then(|x| x.to_str())
+                    .map(|x| IMAGE_EXT.contains(&x.to_lowercase().as_str()))
+                    .unwrap_or(false);
+                if ok {
+                    out.push(p);
+                }
+            }
+        }
+    }
+    out.sort();
+    out
+}
 
 pub struct EditorApp {
     doc: Document,
@@ -7,13 +40,15 @@ pub struct EditorApp {
     texture: Option<egui::TextureHandle>,
     dirty: bool,
     status: String,
+    picker: Option<Vec<PathBuf>>,
+    segmenter: Option<Segmenter>,
 }
 
 impl Default for EditorApp {
     fn default() -> Self {
         let mut doc = Document::new("Sans titre", 1080, 1080);
         doc.pages[0].background = Color::rgb(245, 245, 250);
-        EditorApp { doc, selected: None, texture: None, dirty: true, status: String::new() }
+        EditorApp { doc, selected: None, texture: None, dirty: true, status: String::new(), picker: None, segmenter: None }
     }
 }
 
@@ -46,13 +81,97 @@ impl EditorApp {
     }
 
     fn export(&mut self) {
-        let dir = std::env::var("EXTERNAL_STORAGE").unwrap_or_else(|_| ".".into());
-        let path = std::path::Path::new(&dir).join("kurodaki-export.png");
+        let path = storage().join("Kurodaki/export.png");
+        let _ = std::fs::create_dir_all(path.parent().unwrap());
         self.status = match render_png(&self.doc.pages[0]).map(|b| std::fs::write(&path, b)) {
             Ok(Ok(())) => format!("Exporté : {}", path.display()),
             Ok(Err(e)) => format!("Écriture impossible : {e}"),
             Err(e) => format!("Export impossible : {e}"),
         };
+    }
+
+    fn import(&mut self, path: &std::path::Path) {
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("Image").to_string();
+        let page_w = self.doc.pages[0].width as f32;
+        self.status = match std::fs::read(path) {
+            Err(e) => format!("Lecture impossible : {e} (autorise l'accès aux photos dans les réglages Android)"),
+            Ok(bytes) => match decode_image(&name, &bytes, 2048) {
+                Err(e) => e.to_string(),
+                Ok(mut layer) => {
+                    let k = (page_w * 0.6 / layer.width).min(1.0);
+                    layer.width *= k;
+                    layer.height *= k;
+                    layer.x = 100.0;
+                    layer.y = 100.0;
+                    self.add(layer);
+                    format!("Importé : {name}")
+                }
+            },
+        };
+    }
+
+    fn effect_on_selected(&mut self, effect: Effect) {
+        let Some(i) = self.selected else { return };
+        if let Some(Layer { kind: LayerKind::Image { rgba, .. }, .. }) = self.doc.pages[0].layers.get_mut(i) {
+            apply_effect(rgba, effect);
+            self.dirty = true;
+        } else {
+            self.status = "Sélectionne d'abord un calque image.".into();
+        }
+    }
+
+    fn remove_background(&mut self) {
+        let Some(i) = self.selected else { return };
+        if self.segmenter.is_none() {
+            let model = storage().join("Kurodaki/models/u2netp.onnx");
+            match Segmenter::load(&model, MODEL_SIDE) {
+                Ok(s) => self.segmenter = Some(s),
+                Err(e) => {
+                    self.status = format!("Modèle absent ou invalide ({}): {e}", model.display());
+                    return;
+                }
+            }
+        }
+        let seg = self.segmenter.as_ref().unwrap();
+        let Some(layer) = self.doc.pages[0].layers.get_mut(i) else { return };
+        let LayerKind::Image { width, height, rgba } = &layer.kind else {
+            self.status = "Sélectionne d'abord un calque image.".into();
+            return;
+        };
+        match seg.mask(rgba, *width, *height) {
+            Ok(mask) => {
+                apply_mask(layer, &mask);
+                self.dirty = true;
+                self.status = "Fond retiré (IA locale).".into();
+            }
+            Err(e) => self.status = format!("IA locale : {e}"),
+        }
+    }
+
+    fn save_project(&mut self) {
+        let path = storage().join("Kurodaki/projet.kuro.json");
+        let res = std::fs::create_dir_all(path.parent().unwrap())
+            .map_err(|e| e.to_string())
+            .and_then(|_| self.doc.to_json().map_err(|e| e.to_string()))
+            .and_then(|j| std::fs::write(&path, j).map_err(|e| e.to_string()));
+        self.status = match res {
+            Ok(()) => format!("Projet enregistré : {}", path.display()),
+            Err(e) => format!("Sauvegarde impossible : {e}"),
+        };
+    }
+
+    fn open_project(&mut self) {
+        let path = storage().join("Kurodaki/projet.kuro.json");
+        match std::fs::read_to_string(&path).map_err(|e| e.to_string()).and_then(|s| Document::from_json(&s).map_err(|e| e.to_string())) {
+            Ok(doc) if !doc.pages.is_empty() => {
+                self.doc = doc;
+                self.selected = None;
+                self.dirty = true;
+                self.status = "Projet ouvert.".into();
+            }
+            Ok(_) => self.status = "Projet vide.".into(),
+            Err(e) => self.status = format!("Ouverture impossible : {e}"),
+        }
     }
 
     fn add(&mut self, layer: Layer) {
@@ -73,12 +192,54 @@ impl eframe::App for EditorApp {
                 if ui.button("◯ Ellipse").clicked() {
                     self.add(Layer::ellipse("Ellipse", 300.0, 300.0, 300.0, 300.0, Color::rgb(240, 110, 90)));
                 }
+                if ui.button("🖼 Importer").clicked() {
+                    self.picker = Some(list_images());
+                }
+                if ui.button("✨ Magic Touch").clicked() {
+                    self.effect_on_selected(Effect::AutoEnhance);
+                }
+                if ui.button("✂ Retirer le fond").clicked() {
+                    self.remove_background();
+                }
+                if ui.button("💾 Enregistrer").clicked() {
+                    self.save_project();
+                }
+                if ui.button("📂 Ouvrir").clicked() {
+                    self.open_project();
+                }
                 if ui.button("⬇ Exporter PNG").clicked() {
                     self.export();
                 }
                 ui.label(&self.status);
             });
         });
+
+        let mut chosen: Option<PathBuf> = None;
+        let mut close = false;
+        if let Some(files) = &self.picker {
+            egui::Window::new("Choisir une image").collapsible(false).show(ctx, |ui| {
+                if files.is_empty() {
+                    ui.label("Aucune image trouvée dans Pictures, DCIM/Camera, Download ou Kurodaki. Vérifie l'autorisation Photos.");
+                }
+                egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+                    for f in files {
+                        let label = f.strip_prefix(storage()).unwrap_or(f).display().to_string();
+                        if ui.button(label).clicked() {
+                            chosen = Some(f.clone());
+                        }
+                    }
+                });
+                if ui.button("Fermer").clicked() {
+                    close = true;
+                }
+            });
+        }
+        if let Some(f) = chosen {
+            self.picker = None;
+            self.import(&f);
+        } else if close {
+            self.picker = None;
+        }
 
         egui::SidePanel::right("props").min_width(200.0).show(ctx, |ui| {
             ui.heading("Calques");
@@ -119,6 +280,7 @@ impl eframe::App for EditorApp {
             if let Some(i) = self.selected.filter(|&i| i < page.layers.len()) {
                 let l = &mut page.layers[i];
                 let mut changed = false;
+                let mut effect: Option<Effect> = None;
                 ui.text_edit_singleline(&mut l.name);
                 changed |= ui.add(egui::Slider::new(&mut l.x, -500.0..=1500.0).text("x")).changed();
                 changed |= ui.add(egui::Slider::new(&mut l.y, -500.0..=1500.0).text("y")).changed();
@@ -129,9 +291,31 @@ impl eframe::App for EditorApp {
                 if let LayerKind::Rect { corner_radius } = &mut l.kind {
                     changed |= ui.add(egui::Slider::new(corner_radius, 0.0..=300.0).text("arrondi")).changed();
                 }
+                if matches!(l.kind, LayerKind::Image { .. }) {
+                    ui.separator();
+                    ui.label("Retouches locales");
+                    ui.horizontal_wrapped(|ui| {
+                        for (name, e) in [
+                            ("N&B", Effect::Grayscale),
+                            ("Sépia", Effect::Sepia),
+                            ("Inverser", Effect::Invert),
+                            ("+ Contraste", Effect::Contrast(0.15)),
+                            ("+ Lumière", Effect::Brightness(0.06)),
+                            ("+ Couleurs", Effect::Saturation(1.2)),
+                        ] {
+                            if ui.small_button(name).clicked() {
+                                effect = Some(e);
+                            }
+                        }
+                    });
+                }
                 let mut c = to_c32(l.fill);
                 if ui.color_edit_button_srgba(&mut c).changed() {
                     l.fill = Color::rgb(c.r(), c.g(), c.b());
+                    changed = true;
+                }
+                if let (Some(e), LayerKind::Image { rgba, .. }) = (effect, &mut l.kind) {
+                    apply_effect(rgba, e);
                     changed = true;
                 }
                 self.dirty |= changed;
