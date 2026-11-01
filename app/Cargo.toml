@@ -28,7 +28,7 @@ apk_name = "kurodaki-editor"
 build_targets = ["aarch64-linux-android"]
 
 [package.metadata.android.signing.release]
-path = "$HOME/.android/kurodaki-ci.keystore"
+path = "ci.keystore"
 keystore_password = "android"
 
 [package.metadata.android.sdk]

@@ -37,8 +37,7 @@ jobs:
       - run: cargo install cargo-apk --locked
       - name: Create signing keystore
         run: |
-          mkdir -p "$HOME/.android"
-          keytool -genkeypair -v -keystore "$HOME/.android/kurodaki-ci.keystore" -storepass android -keypass android \
+          keytool -genkeypair -v -keystore app/ci.keystore -storepass android -keypass android \
             -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Kurodaki,O=Kurodaki,C=FR"
       - name: Build APK
         run: |
